@@ -1,0 +1,12 @@
+{
+  "name": "tea-time-cafe",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tea Time Cafe - a small cafe ordering/FAQ chatbot backend and staff dashboard.",
+  "scripts": {
+    "start": "node backend/server.js"
+  },
+  "engines": {
+    "node": ">=20.12.0"
+  }
+}

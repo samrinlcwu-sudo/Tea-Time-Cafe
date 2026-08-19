@@ -1,0 +1,23 @@
+# Environment variables
+.env
+
+# Saved orders (generated, contains customer PII)
+data/orders.json
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor/OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings (machine-specific, not shared config)
+.claude/settings.local.json

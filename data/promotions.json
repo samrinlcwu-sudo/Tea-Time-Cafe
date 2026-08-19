@@ -1,0 +1,47 @@
+[
+  {
+    "id": "happy-hour",
+    "name": "Afternoon Happy Hour",
+    "rule": "20% off all hot coffee drinks, weekdays 2:00pm-4:00pm.",
+    "discount": {
+      "type": "percentage",
+      "value": 20
+    },
+    "eligibility": [
+      "Applies to hot coffee category only",
+      "Weekdays only, 2:00pm-4:00pm",
+      "Dine-in or takeout"
+    ],
+    "active": true
+  },
+  {
+    "id": "student-discount",
+    "name": "Student Discount",
+    "rule": "10% off entire order for students with a valid student ID.",
+    "discount": {
+      "type": "percentage",
+      "value": 10
+    },
+    "eligibility": [
+      "Valid student ID must be shown at pickup/register",
+      "Applies to entire order",
+      "Cannot be combined with other promotions"
+    ],
+    "active": true
+  },
+  {
+    "id": "pastry-bogo",
+    "name": "Buy a Drink, Get a Pastry Free",
+    "rule": "Get one free pastry with the purchase of any large drink.",
+    "discount": {
+      "type": "free_item",
+      "value": "1 pastry (up to $3.50 value)"
+    },
+    "eligibility": [
+      "Requires purchase of one Large-size drink",
+      "Free item must be equal or lesser value than the cheapest pastry",
+      "Limited-time promotion, currently not running"
+    ],
+    "active": false
+  }
+]
