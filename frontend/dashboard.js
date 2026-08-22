@@ -1,4 +1,4 @@
-const ORDER_STATUSES = ["confirmed", "preparing", "ready", "completed", "cancelled"];
+const ORDER_STATUSES = ["NEW", "PREPARING", "READY", "COMPLETED"];
 
 const containerEl = document.getElementById("orders-container");
 const refreshButtonEl = document.getElementById("refresh-button");
@@ -10,7 +10,7 @@ function escapeHtml(value) {
 }
 
 function formatItems(items) {
-  return items
+  return (items || [])
     .map((item) => {
       const details = [item.size, ...(item.options || [])].filter(Boolean).join(", ");
       return `${item.quantity}x ${item.name}${details ? ` (${details})` : ""}`;
@@ -18,14 +18,17 @@ function formatItems(items) {
     .join(", ");
 }
 
-function formatCustomer(customerDetails) {
-  const d = customerDetails || {};
+function formatCustomerInfo(fulfillment) {
+  const f = fulfillment || {};
   const parts = [];
-  if (d.name) parts.push(d.name);
-  if (d.phone) parts.push(d.phone);
-  if (d.address) parts.push(d.address + (d.apartmentUnit ? `, ${d.apartmentUnit}` : ""));
-  if (d.pickupTime) parts.push(`pickup: ${d.pickupTime}`);
-  if (d.deliveryInstructions) parts.push(`note: ${d.deliveryInstructions}`);
+  if (f.name) parts.push(f.name);
+  if (f.type === "delivery") {
+    if (f.phone) parts.push(f.phone);
+    if (f.address) parts.push(f.address + (f.apartment ? `, ${f.apartment}` : ""));
+    if (f.instructions) parts.push(`note: ${f.instructions}`);
+  } else if (f.type === "pickup" && f.pickupTime) {
+    parts.push(`pickup: ${f.pickupTime}`);
+  }
   return parts.length ? parts.join(" · ") : "—";
 }
 
@@ -39,6 +42,7 @@ function renderOrders(orders) {
     .slice()
     .reverse()
     .map((order) => {
+      const fulfillment = order.fulfillment || {};
       const options = ORDER_STATUSES.map(
         (s) => `<option value="${s}"${s === order.status ? " selected" : ""}>${s}</option>`
       ).join("");
@@ -46,9 +50,9 @@ function renderOrders(orders) {
         <tr data-order-id="${escapeHtml(order.orderId)}">
           <td>${escapeHtml(order.orderId)}</td>
           <td>${escapeHtml(formatItems(order.items))}</td>
-          <td>${escapeHtml(order.orderType || "—")}</td>
-          <td>${escapeHtml(formatCustomer(order.customerDetails))}</td>
-          <td>$${Number(order.total).toFixed(2)}</td>
+          <td>${escapeHtml(fulfillment.type || "—")}</td>
+          <td>${escapeHtml(formatCustomerInfo(fulfillment))}</td>
+          <td>$${Number(order.pricing?.grandTotal ?? 0).toFixed(2)}</td>
           <td><select class="status-select">${options}</select></td>
         </tr>
       `;

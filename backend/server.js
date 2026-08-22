@@ -1,935 +1,767 @@
-// Minimal Tea Time Cafe backend: one endpoint, no dependencies, no framework.
-// Run with: node backend/server.js  (Node 20+, uses process.loadEnvFile)
-
-const http = require("http");
-const fs = require("fs");
+// Tea Time Cafe backend: Express server serving the frontend and the chat API.
 const path = require("path");
+const fs = require("fs");
 const crypto = require("crypto");
+const express = require("express");
+const Anthropic = require("@anthropic-ai/sdk");
+require("dotenv").config();
 
 const ROOT = path.join(__dirname, "..");
-
-try {
-  process.loadEnvFile(path.join(ROOT, ".env"));
-} catch {
-  // .env is optional (e.g. vars already set in the environment)
-}
-
 const PORT = process.env.PORT || 3000;
-const LLM_API_KEY = process.env.LLM_API_KEY;
-const LLM_MODEL = process.env.LLM_MODEL;
+const CHAT_MODEL = "claude-haiku-4-5-20251001";
+const FALLBACK_REPLY = "Sorry, I'm having trouble reaching the kitchen right now — please try again in a moment.";
 
-if (!LLM_API_KEY || !LLM_MODEL) {
-  console.warn(
-    "Warning: LLM_API_KEY and/or LLM_MODEL is not set. /api/chat will return " +
-      "500 until both are configured (see .env.example). The dashboard and " +
-      "order endpoints do not require them."
+// Simple flat-rate config — adjust here if rates change. No per-item tax rules.
+const TAX_RATE = 0.08;
+const DELIVERY_FEE = 3.0;
+
+const ORDERS_PATH = path.join(ROOT, "data", "orders.json");
+const ORDER_STATUSES = ["NEW", "PREPARING", "READY", "COMPLETED"];
+
+const BASE_SYSTEM_PROMPT = fs.readFileSync(path.join(ROOT, "prompts", "system-prompt.md"), "utf8");
+const SYSTEM_PROMPT = `${BASE_SYSTEM_PROMPT}\n\n## Menu Lookups\n\nUse the \`getMenu\` tool to look up current, active menu items whenever the customer asks about the menu — never answer from memory or invent items, prices, sizes, or allergens.\n\n## Adding Items\n\nUse the \`addItemToCart\` tool to add an item once you know its id (from getMenu), quantity, and size (if the item has sizes). If a required size is missing, the tool will refuse and tell you what's needed — ask the customer for it instead of guessing. Only call the tool once you have everything it needs.\n\n## Modifying Items\n\nUse the \`modifyItem\` tool to change the quantity, size, or options of an item already in the order — identify it by its position (itemIndex) in the order's items array, as most recently shown to you. If the change is invalid (bad size/option, or quantity below 1), the tool will refuse and explain why — ask the customer rather than retrying with a guess. This tool cannot remove items or take them to zero.\n\n## Removing Items\n\nUse the \`removeItem\` tool to remove an item entirely, or reduce its quantity, from the order — identify it by its position (itemIndex) in the order's items array, as most recently shown to you. Omit \`quantity\` to remove the item entirely; pass a \`quantity\` to remove just that many (the item is removed entirely if that meets or exceeds what's there). If the index doesn't exist, the tool will refuse and explain why — ask the customer rather than retrying with a guess.\n\n## Viewing the Cart\n\nUse the \`viewCart\` tool to see the current order's items, quantities, and customizations — e.g. before confirming, before modifying/removing by index, or whenever the customer asks what's in their order. It does not include a total yet.\n\n## Recommendations\n\nAfter adding an item to the order, you may call \`getRecommendations\` to see 1-2 real, currently-available menu items that pair well with the order. Only mention items the tool actually returns — never invent a suggestion. If the tool returns an empty list, don't offer anything. Offer a suggestion at most once per item — the tool already tracks what's been suggested and won't return the same item twice, so if the customer declines or ignores a suggestion, don't bring it up again.\n\n## Promotions\n\nUse \`applyPromotion\` with no \`promotionId\` to check which active promotions (from data/promotions.json) the current order currently qualifies for, and only mention promotions it actually returns — never invent a discount, percentage, or code. To apply one, call it again with that exact \`promotionId\`. If it applies the Student Discount, tell the customer they'll need to show a valid student ID at pickup/register. Never accept or apply a discount code the customer types in themselves unless it matches a promotion the tool confirms is real, active, and eligible — if it doesn't, tell them it's not valid rather than guessing what they meant.\n\n## Pickup Details\n\nBefore finalizing an order, call \`setPickupDetails\` with no arguments to see what's already been collected. It returns the current name, pickup time, and a \`missing\` list — only ask the customer for what's actually listed as missing. Name is required; pickup time is optional, so if the customer doesn't give one, proceed without it. Once you have new information to record, call the tool again passing just the field(s) you're setting.\n\n## Delivery Details\n\nIf the customer wants delivery instead of pickup, call \`setDeliveryDetails\` with no arguments to see what's already been collected. It returns the current name, phone, address, apartment/unit, delivery instructions, and a \`missing\` list — only ask for what's actually listed as missing. Name, phone, and address are required; apartment/unit and delivery instructions are optional, so don't ask for them unless it's natural to (e.g. after getting the address). Never guess or fill in any of these fields yourself — only record what the customer actually told you. Once you have new information, call the tool again passing just the field(s) you're setting.\n\nBefore checkout on a delivery order, once \`missing\` is empty, read the full captured address back to the customer (street address, apartment/unit if any, and delivery instructions if any) and explicitly ask them to confirm it's correct — do not proceed to checkout without this. If they confirm, call \`setDeliveryDetails\` again with only \`confirmed: true\`. If they correct anything, set the corrected field(s) instead (this automatically clears the prior confirmation), then read the updated address back and ask again.\n\n## Order Total\n\nNever calculate, estimate, or state a subtotal, tax, delivery fee, or total yourself — always call \`getOrderTotal\` and report exactly the numbers it returns. Call it whenever the customer asks what they owe, and always right before final checkout confirmation. Delivery fee only applies to delivery orders; it will be 0 for pickup. If a promotion is applied, its discount amount is already reflected in the numbers returned.\n\n## Order Summary\n\nBefore asking the customer for final checkout confirmation, call \`getOrderSummary\` and present exactly what it returns: the items with quantities/customizations, the fulfillment details (pickup or delivery), the applied promotion (if any), and the full price breakdown. Don't reconstruct this from memory or earlier tool calls — always pull the current state fresh from this tool right before checkout, since anything could have changed since you last checked.\n\n## Confirming and Saving the Order\n\nOnly call \`confirmOrder\` (with confirmed: true) after the customer has explicitly confirmed the summary you presented — a clear \"yes\", \"confirm\", \"place the order\", or equivalent. Never call it proactively, right after showing the summary without a reply, or on an assumption that they're done. Never save a draft, incomplete, or unconfirmed order this way. If it returns an error, tell the customer what's missing or wrong rather than retrying blindly. Never tell the customer their order is placed, and never state an order ID, unless \`confirmOrder\` just returned \`saved: true\` in this same turn — quote the \`orderId\` field exactly as returned, character for character; never invent, guess, shorten, or reformat it.`;
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+const TOOLS = [
+  {
+    name: "getMenu",
+    description: "Returns the café's current menu, limited to active (available) items only. Each item includes id, name, category, description, price, sizes, options, allergens, and dietary tags.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "addItemToCart",
+    description: "Adds a valid, available menu item to the customer's order. Fails with an error describing what's missing if the item id is invalid/unavailable, a required size is missing or not offered by the item, or an option isn't offered by the item — ask the customer rather than retrying with a guess.",
+    input_schema: {
+      type: "object",
+      properties: {
+        itemId: { type: "string", description: "The menu item's id, from getMenu." },
+        quantity: { type: "integer", minimum: 1, description: "How many to add. Defaults to 1." },
+        size: { type: "string", description: "Required if the item has sizes (see getMenu) — must exactly match one of them." },
+        options: { type: "array", items: { type: "string" }, description: "Optional add-ons; each must match one of the item's options." },
+      },
+      required: ["itemId"],
+    },
+  },
+  {
+    name: "modifyItem",
+    description: "Adjusts the quantity, size, and/or options of an item already in the order. Fails with an error if the item index doesn't exist, the size/options aren't valid for that item, or quantity would drop below 1 — ask the customer rather than retrying with a guess. Does not support removing an item.",
+    input_schema: {
+      type: "object",
+      properties: {
+        itemIndex: { type: "integer", minimum: 0, description: "0-based position of the item in the order's current items array." },
+        quantity: { type: "integer", minimum: 1, description: "New quantity. Omit to leave unchanged." },
+        size: { type: "string", description: "New size. Omit to leave unchanged. Must be one of the item's valid sizes." },
+        options: { type: "array", items: { type: "string" }, description: "New full list of options, replacing the existing one. Omit to leave unchanged. Each must be valid for the item." },
+      },
+      required: ["itemIndex"],
+    },
+  },
+  {
+    name: "removeItem",
+    description: "Removes an item from the order entirely, or reduces its quantity. Fails with an error if the item index doesn't exist — ask the customer rather than retrying with a guess.",
+    input_schema: {
+      type: "object",
+      properties: {
+        itemIndex: { type: "integer", minimum: 0, description: "0-based position of the item in the order's current items array." },
+        quantity: { type: "integer", minimum: 1, description: "How many to remove. Omit to remove the item entirely regardless of its current quantity." },
+      },
+      required: ["itemIndex"],
+    },
+  },
+  {
+    name: "viewCart",
+    description: "Returns a concise, itemized summary of the current order: each item's name, quantity, size, and options. Does not include prices or a total.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "getRecommendations",
+    description: "Returns up to 2 real, available menu items that pair well with the current order, for you to suggest to the customer. Excludes items already in the order and items already suggested this session (so a declined or ignored suggestion is never repeated). May return an empty list if there's nothing left to suggest — in that case, don't offer anything.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "applyPromotion",
+    description: "Without promotionId: returns the active promotions from data/promotions.json that the current order is eligible for right now, for you to recommend. With promotionId: attempts to apply that exact promotion. Fails with an error if the id isn't a real, currently-active promotion (never apply or invent a discount code that isn't in this list), if a promotion is already applied, or if the order doesn't meet that promotion's eligibility rules — in which case the error explains why.",
+    input_schema: {
+      type: "object",
+      properties: {
+        promotionId: { type: "string", description: "The promotion's id, from a prior call to this tool. Omit to just check what's eligible." },
+      },
+    },
+  },
+  {
+    name: "setPickupDetails",
+    description: "Records the customer's name and (optional) pickup time for order pickup. Call with no arguments to check what's already been collected and what's still missing, before asking the customer anything. Call again with only the field(s) you're setting — existing values are preserved. Fails if name is set to an empty value.",
+    input_schema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "The customer's name for the pickup order." },
+        pickupTime: { type: "string", description: "Requested pickup time, as the customer said it (e.g. \"3:30pm\", \"in 20 minutes\"). Optional." },
+      },
+    },
+  },
+  {
+    name: "setDeliveryDetails",
+    description: "Records the customer's name, phone number, delivery address, and (optional) apartment/unit and delivery instructions. Call with no arguments to check what's already been collected and what's still missing, before asking the customer anything. Call again with only the field(s) you're setting — existing values are preserved. Never guess or fill in a value the customer hasn't given you. Fails if a required field is set to an empty value. Setting any field clears prior address confirmation, so it must be re-confirmed. Pass confirmed: true (with no other fields, and only after reading the full address back to the customer and getting an explicit yes) to mark the address confirmed for checkout; fails if required fields are still missing.",
+    input_schema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "The customer's name for the delivery order." },
+        phone: { type: "string", description: "Contact phone number, as the customer gave it." },
+        address: { type: "string", description: "Full delivery street address." },
+        apartment: { type: "string", description: "Apartment/unit/suite number, if applicable. Optional." },
+        instructions: { type: "string", description: "Delivery instructions (e.g. gate code, where to leave it). Optional." },
+        confirmed: { type: "boolean", description: "Set true, by itself, once the customer has explicitly confirmed the full address you read back to them." },
+      },
+    },
+  },
+  {
+    name: "getOrderTotal",
+    description: "Returns the deterministic, server-calculated order total: subtotal (real menu prices × quantities), any applied promotion's discount amount, tax, delivery fee (delivery orders only), and the final grand total. This is the only source of truth for prices — never calculate, estimate, or state a subtotal/tax/fee/total yourself. Fails if the order is empty.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "getOrderSummary",
+    description: "Returns the complete, structured order summary for a final pre-checkout review: items with quantities and customizations, fulfillment details (pickup or delivery, whichever was set), the applied promotion (if any), and the full price breakdown. Call this right before asking the customer to confirm and finalize — present exactly what it returns, don't reconstruct it from memory. Fails if the order is empty.",
+    input_schema: { type: "object", properties: {} },
+  },
+  {
+    name: "confirmOrder",
+    description: "Saves the order to data/orders.json with a unique order ID, timestamp, and status \"NEW\". Only call this with confirmed: true, and only after the customer has explicitly confirmed the order summary from getOrderSummary (e.g. said \"yes\", \"confirm it\", \"place the order\") — never call it proactively or on an assumption. Fails if confirmed isn't true, if the order is empty, if fulfillment details are incomplete, if a delivery address hasn't been explicitly confirmed, or if this order was already saved.",
+    input_schema: {
+      type: "object",
+      properties: {
+        confirmed: { type: "boolean", description: "Must be true. Only pass true once the customer has explicitly said they want to place the order." },
+      },
+      required: ["confirmed"],
+    },
+  },
+];
+
+function getMenu() {
+  const menu = JSON.parse(fs.readFileSync(path.join(ROOT, "data", "menu.json"), "utf8"));
+  return menu.filter((item) => item.available);
+}
+
+// Recomputes order.total from scratch, applying order.discount (if any) so a
+// discount survives later cart edits instead of being silently dropped.
+function computeOrderTotal(order, menu) {
+  const base = order.items.reduce((sum, item) => sum + item.price * item.quantity, 0);
+  if (!order.discount) {
+    return Math.round(base * 100) / 100;
+  }
+  // Percentage always comes from the applied promotion's own data, not a
+  // hardcoded copy, so totals stay correct if promotions.json changes.
+  const rate = 1 - (order.discount.discount?.value || 0) / 100;
+  if (order.discount.id === "happy-hour") {
+    const discounted = order.items.reduce((sum, item) => {
+      const category = menu.find((m) => m.id === item.id)?.category;
+      return sum + item.price * item.quantity * (category === "coffee" ? rate : 1);
+    }, 0);
+    return Math.round(discounted * 100) / 100;
+  }
+  if (order.discount.id === "student-discount") {
+    return Math.round(base * rate * 100) / 100;
+  }
+  return Math.round(base * 100) / 100;
+}
+
+function addItemToCart(input, order) {
+  const { itemId, quantity, size, options } = input || {};
+  const menu = getMenu();
+  const menuItem = menu.find((item) => item.id === itemId);
+
+  if (!menuItem) {
+    return { error: `No available menu item with id "${itemId}". Use getMenu to look up valid ids.` };
+  }
+
+  if (menuItem.sizes.length > 0 && !menuItem.sizes.includes(size)) {
+    return {
+      error: "size_required",
+      message: `"${menuItem.name}" requires a size. Ask the customer to choose one.`,
+      validSizes: menuItem.sizes,
+    };
+  }
+
+  const requestedOptions = Array.isArray(options) ? options : [];
+  const invalidOptions = requestedOptions.filter((opt) => !menuItem.options.includes(opt));
+  if (invalidOptions.length > 0) {
+    return {
+      error: "invalid_options",
+      message: `These options aren't available for "${menuItem.name}": ${invalidOptions.join(", ")}.`,
+      validOptions: menuItem.options,
+    };
+  }
+
+  const qty = Number.isInteger(quantity) && quantity > 0 ? quantity : 1;
+  const itemSize = menuItem.sizes.length > 0 ? size : null;
+  const optionsKey = [...requestedOptions].sort().join("|");
+
+  // Merge into an identical existing line instead of creating a duplicate,
+  // so a repeated add (customer or model) increments quantity, not a new row.
+  const existing = order.items.find(
+    (item) => item.id === menuItem.id && item.size === itemSize && [...item.options].sort().join("|") === optionsKey
   );
-}
 
-const systemPrompt = fs.readFileSync(path.join(ROOT, "prompts", "system_prompt.md"), "utf8");
-const menu = JSON.parse(fs.readFileSync(path.join(ROOT, "data", "menu.json"), "utf8"));
-const promotions = JSON.parse(fs.readFileSync(path.join(ROOT, "data", "promotions.json"), "utf8"));
-
-const contextBlock =
-  `Here is the current menu data as JSON. This is the only valid source of ` +
-  `menu items, sizes, and prices — never invent or assume any item, size, ` +
-  `or price that is not present here:\n${JSON.stringify(menu)}\n\n` +
-  `Here is the current promotions data as JSON:\n${JSON.stringify(promotions)}`;
-
-// In-memory only — order state lives for the life of the process, no database.
-const sessions = new Map();
-
-const ORDERS_FILE = path.join(ROOT, "data", "orders.json");
-
-function readSavedOrders() {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(ORDERS_FILE, "utf8"));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-// Appends one confirmed order as a new record in data/orders.json. Only ever
-// called from confirmOrder after order.confirmed is set — never for a draft.
-function saveConfirmedOrder(order) {
-  const record = {
-    orderId: crypto.randomUUID(),
-    timestamp: new Date().toISOString(),
-    status: order.status,
-    items: order.items,
-    orderType: order.orderType,
-    customerDetails: order.customerDetails,
-    promotion: order.promotion,
-    total: order.total,
-  };
-
-  const orders = readSavedOrders();
-  orders.push(record);
-  fs.writeFileSync(ORDERS_FILE, JSON.stringify(orders, null, 2));
-
-  return record;
-}
-
-// Statuses staff can move a saved order through from the dashboard.
-// "confirmed" is the initial value set by confirmOrder.
-const ORDER_STATUSES = ["confirmed", "preparing", "ready", "completed", "cancelled"];
-
-// Updates the status of one saved order in data/orders.json.
-function updateOrderStatus(orderId, status) {
-  if (typeof orderId !== "string" || orderId.trim() === "") {
-    return { ok: false, error: "'orderId' is required." };
-  }
-  if (typeof status !== "string" || !ORDER_STATUSES.includes(status)) {
-    return { ok: false, error: `'status' must be one of: ${ORDER_STATUSES.join(", ")}.` };
+  let cartItem;
+  if (existing) {
+    existing.quantity += qty;
+    cartItem = existing;
+  } else {
+    cartItem = {
+      id: menuItem.id,
+      name: menuItem.name,
+      quantity: qty,
+      size: itemSize,
+      options: requestedOptions,
+      price: menuItem.price,
+    };
+    order.items.push(cartItem);
   }
 
-  const orders = readSavedOrders();
-  const record = orders.find((o) => o.orderId === orderId);
-  if (!record) {
-    return { ok: false, error: `No saved order matches "${orderId}".` };
-  }
+  order.total = computeOrderTotal(order, menu);
 
-  record.status = status;
-  fs.writeFileSync(ORDERS_FILE, JSON.stringify(orders, null, 2));
-
-  return { ok: true, order: record };
+  return { added: cartItem, cart: { items: order.items, total: order.total } };
 }
 
-function createOrder() {
+function modifyItem(input, order) {
+  const { itemIndex, quantity, size, options } = input || {};
+
+  if (!Number.isInteger(itemIndex) || itemIndex < 0 || itemIndex >= order.items.length) {
+    return { error: `No item at index ${itemIndex}. The order currently has ${order.items.length} item(s).` };
+  }
+
+  const cartItem = order.items[itemIndex];
+  const menu = getMenu();
+  const menuItem = menu.find((item) => item.id === cartItem.id);
+
+  if (!menuItem) {
+    return { error: `"${cartItem.name}" is no longer available and can't be modified.` };
+  }
+
+  if (size !== undefined) {
+    if (menuItem.sizes.length === 0 || !menuItem.sizes.includes(size)) {
+      return {
+        error: "invalid_size",
+        message: `"${menuItem.name}" doesn't offer size "${size}".`,
+        validSizes: menuItem.sizes,
+      };
+    }
+  }
+
+  if (options !== undefined) {
+    const requestedOptions = Array.isArray(options) ? options : [];
+    const invalidOptions = requestedOptions.filter((opt) => !menuItem.options.includes(opt));
+    if (invalidOptions.length > 0) {
+      return {
+        error: "invalid_options",
+        message: `These options aren't available for "${menuItem.name}": ${invalidOptions.join(", ")}.`,
+        validOptions: menuItem.options,
+      };
+    }
+  }
+
+  if (quantity !== undefined && (!Number.isInteger(quantity) || quantity < 1)) {
+    return { error: "Quantity must be at least 1. Removing items isn't supported yet." };
+  }
+
+  if (size !== undefined) cartItem.size = size;
+  if (options !== undefined) cartItem.options = Array.isArray(options) ? options : [];
+  if (quantity !== undefined) cartItem.quantity = quantity;
+
+  order.total = computeOrderTotal(order, menu);
+
+  return { updated: cartItem, cart: { items: order.items, total: order.total } };
+}
+
+function removeItem(input, order) {
+  const { itemIndex, quantity } = input || {};
+
+  if (!Number.isInteger(itemIndex) || itemIndex < 0 || itemIndex >= order.items.length) {
+    return { error: `No item at index ${itemIndex}. The order currently has ${order.items.length} item(s).` };
+  }
+
+  const cartItem = order.items[itemIndex];
+  const name = cartItem.name;
+  let fullyRemoved = true;
+
+  if (quantity !== undefined) {
+    if (!Number.isInteger(quantity) || quantity < 1) {
+      return { error: "Quantity to remove must be at least 1." };
+    }
+    if (quantity < cartItem.quantity) {
+      cartItem.quantity -= quantity;
+      fullyRemoved = false;
+    } else {
+      order.items.splice(itemIndex, 1);
+    }
+  } else {
+    order.items.splice(itemIndex, 1);
+  }
+
+  order.total = computeOrderTotal(order, getMenu());
+
+  return { name, fullyRemoved, cart: { items: order.items, total: order.total } };
+}
+
+function viewCart(order) {
   return {
-    items: [], // [{ name, quantity, options }]
-    orderType: null, // e.g. "pickup" | "delivery"
-    customerDetails: {}, // e.g. { name, phone }
-    promotion: null,
-    total: 0,
-    confirmed: false,
-    status: "building", // "building" | "confirmed"
+    items: order.items.map((item) => ({
+      name: item.name,
+      quantity: item.quantity,
+      size: item.size,
+      options: item.options,
+    })),
   };
 }
 
-function getSession(sessionId) {
-  if (typeof sessionId === "string" && sessions.has(sessionId)) {
-    return { sessionId, order: sessions.get(sessionId) };
+const DRINK_CATEGORIES = ["coffee", "tea", "cold drinks"];
+const FOOD_CATEGORIES = ["pastries", "food", "snacks"];
+
+function getRecommendations(order) {
+  const menu = getMenu();
+  const cartIds = new Set(order.items.map((item) => item.id));
+  const suggestedIds = new Set(order.suggestedItemIds);
+
+  const candidates = menu.filter((item) => !cartIds.has(item.id) && !suggestedIds.has(item.id));
+  if (candidates.length === 0) {
+    return { recommendations: [] };
   }
-  const id = crypto.randomUUID();
-  const order = createOrder();
-  sessions.set(id, order);
-  return { sessionId: id, order };
+
+  const cartCategories = new Set(
+    order.items.map((item) => menu.find((m) => m.id === item.id)?.category).filter(Boolean)
+  );
+  const hasDrink = [...cartCategories].some((c) => DRINK_CATEGORIES.includes(c));
+  const hasFood = [...cartCategories].some((c) => FOOD_CATEGORIES.includes(c));
+
+  let preferred = candidates;
+  if (hasDrink && !hasFood) {
+    preferred = candidates.filter((item) => FOOD_CATEGORIES.includes(item.category));
+  } else if (hasFood && !hasDrink) {
+    preferred = candidates.filter((item) => DRINK_CATEGORIES.includes(item.category));
+  }
+  if (preferred.length === 0) {
+    preferred = candidates;
+  }
+
+  const picks = preferred.slice(0, 2);
+  picks.forEach((item) => order.suggestedItemIds.push(item.id));
+
+  return {
+    recommendations: picks.map((item) => ({
+      id: item.id,
+      name: item.name,
+      category: item.category,
+      description: item.description,
+      price: item.price,
+    })),
+  };
+}
+
+function getActivePromotions() {
+  const promotions = JSON.parse(fs.readFileSync(path.join(ROOT, "data", "promotions.json"), "utf8"));
+  return promotions.filter((promo) => promo.active);
+}
+
+function isHappyHourWindow(date = new Date()) {
+  const day = date.getDay();
+  const hour = date.getHours();
+  return day >= 1 && day <= 5 && hour >= 14 && hour < 16;
+}
+
+function checkPromotionEligibility(promo, order, menu) {
+  if (promo.id === "happy-hour") {
+    const hasHotCoffee = order.items.some((item) => menu.find((m) => m.id === item.id)?.category === "coffee");
+    if (!hasHotCoffee) {
+      return { eligible: false, reason: "Requires at least one hot coffee item in the order." };
+    }
+    if (!isHappyHourWindow()) {
+      return { eligible: false, reason: "Only valid on weekdays between 2:00pm and 4:00pm." };
+    }
+    return { eligible: true };
+  }
+  if (promo.id === "student-discount") {
+    if (order.items.length === 0) {
+      return { eligible: false, reason: "The order is empty." };
+    }
+    return { eligible: true, note: "Customer must show a valid student ID at pickup/register." };
+  }
+  return { eligible: false, reason: "This promotion isn't currently available." };
+}
+
+function applyPromotion(input, order) {
+  const { promotionId } = input || {};
+  const menu = getMenu();
+  const activePromotions = getActivePromotions();
+
+  if (!promotionId) {
+    const recommendations = activePromotions
+      .map((promo) => ({ promo, elig: checkPromotionEligibility(promo, order, menu) }))
+      .filter(({ elig }) => elig.eligible)
+      .map(({ promo, elig }) => ({
+        id: promo.id,
+        name: promo.name,
+        rule: promo.rule,
+        discount: promo.discount,
+        note: elig.note,
+      }));
+    return { eligiblePromotions: recommendations };
+  }
+
+  const promo = activePromotions.find((p) => p.id === promotionId);
+  if (!promo) {
+    return { error: `"${promotionId}" is not a recognized, active promotion. Never apply or invent a discount code that isn't in data/promotions.json.` };
+  }
+
+  if (order.discount) {
+    return { error: `"${order.discount.name}" is already applied, and promotions can't be combined.` };
+  }
+
+  const elig = checkPromotionEligibility(promo, order, menu);
+  if (!elig.eligible) {
+    return { error: elig.reason };
+  }
+
+  order.discount = { id: promo.id, name: promo.name, discount: promo.discount };
+  order.total = computeOrderTotal(order, menu);
+
+  return { applied: order.discount, note: elig.note, cart: { items: order.items, total: order.total } };
+}
+
+function setPickupDetails(input, order) {
+  const { name, pickupTime } = input || {};
+
+  if (name !== undefined) {
+    const trimmed = typeof name === "string" ? name.trim() : "";
+    if (!trimmed) {
+      return { error: "Name cannot be empty." };
+    }
+    order.customerDetails.name = trimmed;
+    order.orderType = "pickup";
+  }
+
+  if (pickupTime !== undefined) {
+    const trimmed = typeof pickupTime === "string" ? pickupTime.trim() : "";
+    order.customerDetails.pickupTime = trimmed || undefined;
+    order.orderType = "pickup";
+  }
+
+  const missing = [];
+  if (!order.customerDetails.name) missing.push("name");
+
+  return {
+    orderType: order.orderType,
+    name: order.customerDetails.name || null,
+    pickupTime: order.customerDetails.pickupTime || null,
+    missing,
+  };
+}
+
+function setDeliveryDetails(input, order) {
+  const { name, phone, address, apartment, instructions, confirmed } = input || {};
+  let anyFieldChanged = false;
+
+  const requiredFields = { name, phone, address };
+  for (const [field, value] of Object.entries(requiredFields)) {
+    if (value !== undefined) {
+      const trimmed = typeof value === "string" ? value.trim() : "";
+      if (!trimmed) {
+        return { error: `${field} cannot be empty.` };
+      }
+      order.customerDetails[field] = trimmed;
+      order.orderType = "delivery";
+      anyFieldChanged = true;
+    }
+  }
+
+  if (apartment !== undefined) {
+    const trimmed = typeof apartment === "string" ? apartment.trim() : "";
+    order.customerDetails.apartment = trimmed || undefined;
+    order.orderType = "delivery";
+    anyFieldChanged = true;
+  }
+
+  if (instructions !== undefined) {
+    const trimmed = typeof instructions === "string" ? instructions.trim() : "";
+    order.customerDetails.instructions = trimmed || undefined;
+    order.orderType = "delivery";
+    anyFieldChanged = true;
+  }
+
+  if (anyFieldChanged) {
+    order.customerDetails.addressConfirmed = false;
+  }
+
+  const missing = ["name", "phone", "address"].filter((field) => !order.customerDetails[field]);
+
+  if (confirmed === true && !anyFieldChanged) {
+    if (missing.length > 0) {
+      return { error: `Can't confirm yet — still missing: ${missing.join(", ")}.` };
+    }
+    order.customerDetails.addressConfirmed = true;
+  }
+
+  return {
+    orderType: order.orderType,
+    name: order.customerDetails.name || null,
+    phone: order.customerDetails.phone || null,
+    address: order.customerDetails.address || null,
+    apartment: order.customerDetails.apartment || null,
+    instructions: order.customerDetails.instructions || null,
+    missing,
+    addressConfirmed: !!order.customerDetails.addressConfirmed,
+  };
 }
 
 function round2(n) {
   return Math.round(n * 100) / 100;
 }
 
-// Recomputes total from current items, then reapplies the order's promotion
-// (if any) so total stays correct after every add/modify/remove/apply.
-function recalculateTotal(order) {
-  const subtotal = round2(order.items.reduce((sum, item) => sum + item.price * item.quantity, 0));
-  if (order.promotion && order.promotion.discount.type === "percentage") {
-    order.total = round2(subtotal * (1 - order.promotion.discount.value / 100));
-  } else {
-    order.total = subtotal;
-  }
+// The single deterministic price calculation for the whole order. Only ever
+// reads real menu prices/quantities and the applied promotion — the model
+// never computes or states a dollar figure that didn't come from here.
+function computeOrderBreakdown(order, menu) {
+  const subtotal = order.items.reduce((sum, item) => sum + item.price * item.quantity, 0);
+  const afterDiscount = computeOrderTotal(order, menu);
+  const discountAmount = round2(subtotal - afterDiscount);
+  const tax = round2(afterDiscount * TAX_RATE);
+  const deliveryFee = order.orderType === "delivery" ? DELIVERY_FEE : 0;
+  const grandTotal = round2(afterDiscount + tax + deliveryFee);
+
+  return {
+    subtotal: round2(subtotal),
+    discount: order.discount ? { name: order.discount.name, amount: discountAmount } : null,
+    afterDiscount: round2(afterDiscount),
+    taxRate: TAX_RATE,
+    tax,
+    deliveryFee,
+    grandTotal,
+  };
 }
 
-// Plain-text order summary (order type/customer details, items with
-// quantities + customizations, promotion, total) for the LLM to relay to
-// the customer and to check what's already known before asking again.
-function formatOrderSummary(order) {
-  const lines = [];
+function getOrderTotal(order) {
+  if (order.items.length === 0) {
+    return { error: "The order is empty — there's nothing to total yet." };
+  }
+  return computeOrderBreakdown(order, getMenu());
+}
 
-  if (order.confirmed) {
-    lines.push("Status: CONFIRMED — this order is already finalized.");
+function getOrderSummary(order) {
+  if (order.items.length === 0) {
+    return { error: "The order is empty — there's nothing to summarize yet." };
   }
 
-  if (order.orderType) {
-    const d = order.customerDetails;
-    const details = [];
-    if (d.name) details.push(`name: ${d.name}`);
-    if (d.phone) details.push(`phone: ${d.phone}`);
-    if (d.address) details.push(`address: ${d.address}`);
-    if (d.apartmentUnit) details.push(`apartment/unit: ${d.apartmentUnit}`);
-    if (d.deliveryInstructions) details.push(`delivery instructions: ${d.deliveryInstructions}`);
-    if (d.pickupTime) details.push(`pickup time: ${d.pickupTime}`);
-    lines.push(`Order type: ${order.orderType}${details.length ? ` (${details.join(", ")})` : ""}`);
+  const menu = getMenu();
+
+  const items = order.items.map((item) => ({
+    name: item.name,
+    quantity: item.quantity,
+    size: item.size,
+    options: item.options,
+  }));
+
+  let fulfillment = { type: order.orderType };
+  if (order.orderType === "pickup") {
+    fulfillment = {
+      type: "pickup",
+      name: order.customerDetails.name || null,
+      pickupTime: order.customerDetails.pickupTime || null,
+    };
+  } else if (order.orderType === "delivery") {
+    fulfillment = {
+      type: "delivery",
+      name: order.customerDetails.name || null,
+      phone: order.customerDetails.phone || null,
+      address: order.customerDetails.address || null,
+      apartment: order.customerDetails.apartment || null,
+      instructions: order.customerDetails.instructions || null,
+      addressConfirmed: !!order.customerDetails.addressConfirmed,
+    };
+  }
+
+  const promotion = order.discount ? { id: order.discount.id, name: order.discount.name } : null;
+
+  return {
+    items,
+    fulfillment,
+    promotion,
+    pricing: computeOrderBreakdown(order, menu),
+  };
+}
+
+function confirmOrder(input, order) {
+  const { confirmed } = input || {};
+
+  if (confirmed !== true) {
+    return { error: "Order not confirmed. Only call this after the customer has explicitly confirmed the order summary." };
+  }
+
+  if (order.confirmed) {
+    return { error: "This order was already confirmed and saved.", orderId: order.orderId, status: order.status };
   }
 
   if (order.items.length === 0) {
-    lines.push("The order is currently empty.");
-    return lines.join("\n");
+    return { error: "Cannot confirm an empty order." };
   }
 
-  for (const item of order.items) {
-    const details = [item.size, ...item.options].filter(Boolean).join(", ");
-    const suffix = details ? ` (${details})` : "";
-    lines.push(
-      `- id ${item.id}: ${item.quantity}x ${item.name}${suffix} — $${round2(
-        item.price * item.quantity
-      ).toFixed(2)}`
-    );
-  }
-
-  if (order.promotion) {
-    lines.push(
-      `Applied promotion: ${order.promotion.name} (${
-        order.promotion.discount.type === "percentage"
-          ? `${order.promotion.discount.value}% off`
-          : order.promotion.discount.value
-      })`
-    );
-  }
-
-  lines.push(`Total: $${order.total.toFixed(2)}`);
-  return lines.join("\n");
-}
-
-// Adds one line item to the order after validating it against data/menu.json.
-// Returns { ok: true, item } or { ok: false, error } — never mutates the order on failure.
-function addItemToOrder(order, input) {
-  if (order.confirmed) {
-    return { ok: false, error: "This order has already been confirmed and can no longer be changed." };
-  }
-
-  const itemId = typeof input.itemId === "string" ? input.itemId.trim() : "";
-  if (!itemId) {
-    return { ok: false, error: "'itemId' is required." };
-  }
-
-  const menuItem =
-    menu.find((m) => m.id === itemId) ||
-    menu.find((m) => m.name.toLowerCase() === itemId.toLowerCase());
-
-  if (!menuItem) {
-    return { ok: false, error: `No menu item matches "${itemId}". It is not on the menu.` };
-  }
-  if (!menuItem.available) {
-    return { ok: false, error: `${menuItem.name} is currently unavailable.` };
-  }
-
-  let size = null;
-  if (menuItem.sizes.length > 0) {
-    if (typeof input.size !== "string" || input.size.trim() === "") {
-      return {
-        ok: false,
-        error: `A size is required for ${menuItem.name}.`,
-        missing: "size",
-        validSizes: menuItem.sizes,
-      };
-    }
-    const match = menuItem.sizes.find((s) => s.toLowerCase() === input.size.trim().toLowerCase());
-    if (!match) {
-      return {
-        ok: false,
-        error: `"${input.size}" is not a valid size for ${menuItem.name}.`,
-        validSizes: menuItem.sizes,
-      };
-    }
-    size = match;
-  }
-
-  let options = [];
-  if (input.options !== undefined) {
-    if (!Array.isArray(input.options) || !input.options.every((o) => typeof o === "string")) {
-      return { ok: false, error: "'options' must be an array of strings." };
-    }
-    for (const opt of input.options) {
-      const match = menuItem.options.find((o) => o.toLowerCase() === opt.toLowerCase());
-      if (!match) {
-        return {
-          ok: false,
-          error: `"${opt}" is not a valid option for ${menuItem.name}.`,
-          validOptions: menuItem.options,
-        };
-      }
-      options.push(match);
-    }
-  }
-
-  let quantity = 1;
-  if (input.quantity !== undefined) {
-    quantity = Number(input.quantity);
-    if (!Number.isInteger(quantity) || quantity < 1) {
-      return { ok: false, error: "'quantity' must be a positive integer." };
-    }
-  }
-
-  const orderItem = {
-    id: crypto.randomUUID(),
-    menuItemId: menuItem.id,
-    name: menuItem.name,
-    quantity,
-    size,
-    options,
-    price: menuItem.price,
-  };
-  order.items.push(orderItem);
-  recalculateTotal(order);
-
-  return { ok: true, item: orderItem };
-}
-
-// Changes quantity, size, and/or options on an item already in the order.
-// Re-validates any changed field against data/menu.json. Leaves the order
-// untouched if any provided field fails validation.
-function modifyOrderItem(order, input) {
-  if (order.confirmed) {
-    return { ok: false, error: "This order has already been confirmed and can no longer be changed." };
-  }
-
-  const orderItemId = typeof input.orderItemId === "string" ? input.orderItemId.trim() : "";
-  if (!orderItemId) {
-    return { ok: false, error: "'orderItemId' is required." };
-  }
-
-  const item = order.items.find((i) => i.id === orderItemId);
-  if (!item) {
-    return { ok: false, error: `No order item matches "${orderItemId}".` };
-  }
-
-  if (input.quantity === undefined && input.size === undefined && input.options === undefined) {
-    return { ok: false, error: "Provide at least one of 'quantity', 'size', or 'options' to change." };
-  }
-
-  const menuItem = menu.find((m) => m.id === item.menuItemId);
-  if (!menuItem) {
-    return { ok: false, error: `${item.name} is no longer on the menu and cannot be modified.` };
-  }
-
-  let quantity = item.quantity;
-  if (input.quantity !== undefined) {
-    quantity = Number(input.quantity);
-    if (!Number.isInteger(quantity) || quantity < 1) {
-      return { ok: false, error: "'quantity' must be a positive integer." };
-    }
-  }
-
-  let size = item.size;
-  if (input.size !== undefined) {
-    if (menuItem.sizes.length === 0) {
-      return { ok: false, error: `${menuItem.name} does not have sizes to change.` };
-    }
-    if (typeof input.size !== "string" || input.size.trim() === "") {
-      return {
-        ok: false,
-        error: `A valid size is required for ${menuItem.name}.`,
-        validSizes: menuItem.sizes,
-      };
-    }
-    const match = menuItem.sizes.find((s) => s.toLowerCase() === input.size.trim().toLowerCase());
-    if (!match) {
-      return {
-        ok: false,
-        error: `"${input.size}" is not a valid size for ${menuItem.name}.`,
-        validSizes: menuItem.sizes,
-      };
-    }
-    size = match;
-  }
-
-  let options = item.options;
-  if (input.options !== undefined) {
-    if (!Array.isArray(input.options) || !input.options.every((o) => typeof o === "string")) {
-      return { ok: false, error: "'options' must be an array of strings." };
-    }
-    const validated = [];
-    for (const opt of input.options) {
-      const match = menuItem.options.find((o) => o.toLowerCase() === opt.toLowerCase());
-      if (!match) {
-        return {
-          ok: false,
-          error: `"${opt}" is not a valid option for ${menuItem.name}.`,
-          validOptions: menuItem.options,
-        };
-      }
-      validated.push(match);
-    }
-    options = validated;
-  }
-
-  item.quantity = quantity;
-  item.size = size;
-  item.options = options;
-  recalculateTotal(order);
-
-  return { ok: true, item };
-}
-
-// Removes one line item from the order entirely. Returns { ok: true, item }
-// (the removed item) or { ok: false, error } if no such item exists.
-function removeOrderItem(order, input) {
-  if (order.confirmed) {
-    return { ok: false, error: "This order has already been confirmed and can no longer be changed." };
-  }
-
-  const orderItemId = typeof input.orderItemId === "string" ? input.orderItemId.trim() : "";
-  if (!orderItemId) {
-    return { ok: false, error: "'orderItemId' is required." };
-  }
-
-  const index = order.items.findIndex((i) => i.id === orderItemId);
-  if (index === -1) {
-    return { ok: false, error: `No order item matches "${orderItemId}".` };
-  }
-
-  const [removed] = order.items.splice(index, 1);
-  recalculateTotal(order);
-
-  return { ok: true, item: removed };
-}
-
-// Applies an active promotion from data/promotions.json to the order. Only
-// checks that the promotion exists and is active — conversational eligibility
-// (time window, valid ID, minimum size, etc.) is the model's responsibility
-// to confirm before calling this. Replaces any promotion already applied,
-// since the order only tracks one at a time (promotions aren't combinable).
-function applyPromotion(order, input) {
-  if (order.confirmed) {
-    return { ok: false, error: "This order has already been confirmed and can no longer be changed." };
-  }
-
-  const promotionId = typeof input.promotionId === "string" ? input.promotionId.trim() : "";
-  if (!promotionId) {
-    return { ok: false, error: "'promotionId' is required." };
-  }
-
-  const promo =
-    promotions.find((p) => p.id === promotionId) ||
-    promotions.find((p) => p.name.toLowerCase() === promotionId.toLowerCase());
-
-  if (!promo) {
-    return { ok: false, error: `No promotion matches "${promotionId}".` };
-  }
-  if (!promo.active) {
-    return { ok: false, error: `${promo.name} is not currently active.` };
-  }
-
-  order.promotion = { id: promo.id, name: promo.name, discount: promo.discount };
-  recalculateTotal(order);
-
-  return { ok: true, promotion: order.promotion, total: order.total };
-}
-
-// Sets the order as pickup and records the customer's name (required) and an
-// optional pickup time. This is the only order type currently supported.
-function setPickupDetails(order, input) {
-  if (order.confirmed) {
-    return { ok: false, error: "This order has already been confirmed and can no longer be changed." };
-  }
-
-  const name = typeof input.customerName === "string" ? input.customerName.trim() : "";
-  if (!name) {
-    return { ok: false, error: "'customerName' is required." };
-  }
-
-  let pickupTime;
-  if (input.pickupTime !== undefined && input.pickupTime !== null) {
-    if (typeof input.pickupTime !== "string" || input.pickupTime.trim() === "") {
-      return { ok: false, error: "'pickupTime' must be a non-empty string when provided." };
-    }
-    pickupTime = input.pickupTime.trim();
-  }
-
-  order.orderType = "pickup";
-  order.customerDetails = pickupTime ? { name, pickupTime } : { name };
-
-  return { ok: true, orderType: order.orderType, customerDetails: order.customerDetails };
-}
-
-// Sets the order as delivery and records the customer's name, phone, and
-// address (required), plus apartment/unit and delivery instructions if
-// given. Never fills in a missing required field — the caller must provide it.
-function setDeliveryDetails(order, input) {
-  if (order.confirmed) {
-    return { ok: false, error: "This order has already been confirmed and can no longer be changed." };
-  }
-
-  const name = typeof input.customerName === "string" ? input.customerName.trim() : "";
-  if (!name) {
-    return { ok: false, error: "'customerName' is required." };
-  }
-
-  const phone = typeof input.phone === "string" ? input.phone.trim() : "";
-  if (!phone) {
-    return { ok: false, error: "'phone' is required." };
-  }
-
-  const address = typeof input.address === "string" ? input.address.trim() : "";
-  if (!address) {
-    return { ok: false, error: "'address' is required." };
-  }
-
-  let apartmentUnit;
-  if (input.apartmentUnit !== undefined && input.apartmentUnit !== null) {
-    if (typeof input.apartmentUnit !== "string" || input.apartmentUnit.trim() === "") {
-      return { ok: false, error: "'apartmentUnit' must be a non-empty string when provided." };
-    }
-    apartmentUnit = input.apartmentUnit.trim();
-  }
-
-  let deliveryInstructions;
-  if (input.deliveryInstructions !== undefined && input.deliveryInstructions !== null) {
-    if (typeof input.deliveryInstructions !== "string" || input.deliveryInstructions.trim() === "") {
-      return { ok: false, error: "'deliveryInstructions' must be a non-empty string when provided." };
-    }
-    deliveryInstructions = input.deliveryInstructions.trim();
-  }
-
-  order.orderType = "delivery";
-  order.customerDetails = {
-    name,
-    phone,
-    address,
-    ...(apartmentUnit ? { apartmentUnit } : {}),
-    ...(deliveryInstructions ? { deliveryInstructions } : {}),
-  };
-
-  return { ok: true, orderType: order.orderType, customerDetails: order.customerDetails };
-}
-
-// Finalizes the order. Only succeeds if there's something to confirm and the
-// required order-type details are already on record — the model must only
-// call this right after the customer explicitly confirms the final summary,
-// never on an ambiguous reply. This is the only place order.confirmed and
-// order.status change, so nothing is "finalized" any other way.
-function confirmOrder(order) {
-  if (order.items.length === 0) {
-    return { ok: false, error: "Cannot confirm an empty order." };
-  }
-  if (order.confirmed) {
-    return { ok: false, error: "Order is already confirmed." };
-  }
   if (!order.orderType) {
-    return { ok: false, error: "Order type (pickup or delivery) must be set before confirming." };
+    return { error: "Fulfillment type (pickup or delivery) hasn't been set yet." };
   }
+
   if (order.orderType === "pickup" && !order.customerDetails.name) {
-    return { ok: false, error: "Customer name is required before confirming a pickup order." };
+    return { error: "Pickup name is still missing." };
   }
-  if (
-    order.orderType === "delivery" &&
-    (!order.customerDetails.name || !order.customerDetails.phone || !order.customerDetails.address)
-  ) {
-    return { ok: false, error: "Name, phone, and address are required before confirming a delivery order." };
+
+  if (order.orderType === "delivery") {
+    const missingDelivery = ["name", "phone", "address"].filter((field) => !order.customerDetails[field]);
+    if (missingDelivery.length > 0) {
+      return { error: `Delivery details still missing: ${missingDelivery.join(", ")}.` };
+    }
+    if (!order.customerDetails.addressConfirmed) {
+      return { error: "The delivery address hasn't been explicitly confirmed by the customer yet." };
+    }
   }
+
+  const summary = getOrderSummary(order);
+  const record = {
+    orderId: crypto.randomUUID(),
+    timestamp: new Date().toISOString(),
+    status: "NEW",
+    items: summary.items,
+    fulfillment: summary.fulfillment,
+    promotion: summary.promotion,
+    pricing: summary.pricing,
+  };
+
+  const orders = JSON.parse(fs.readFileSync(ORDERS_PATH, "utf8"));
+  orders.push(record);
+  fs.writeFileSync(ORDERS_PATH, JSON.stringify(orders, null, 2) + "\n");
 
   order.confirmed = true;
   order.status = "confirmed";
+  order.orderId = record.orderId;
 
-  try {
-    const saved = saveConfirmedOrder(order);
-    return { ok: true, order, savedOrderId: saved.orderId };
-  } catch {
-    // Roll back — an order is never left marked confirmed unless it was
-    // actually saved.
-    order.confirmed = false;
-    order.status = "building";
-    return { ok: false, error: "Failed to save the confirmed order. Please try confirming again." };
+  return { saved: true, orderId: record.orderId, timestamp: record.timestamp, status: record.status };
+}
+
+function runTool(name, input, order) {
+  if (name === "getMenu") return getMenu();
+  if (name === "addItemToCart") return addItemToCart(input, order);
+  if (name === "modifyItem") return modifyItem(input, order);
+  if (name === "removeItem") return removeItem(input, order);
+  if (name === "viewCart") return viewCart(order);
+  if (name === "getRecommendations") return getRecommendations(order);
+  if (name === "applyPromotion") return applyPromotion(input, order);
+  if (name === "setPickupDetails") return setPickupDetails(input, order);
+  if (name === "setDeliveryDetails") return setDeliveryDetails(input, order);
+  if (name === "getOrderTotal") return getOrderTotal(order);
+  if (name === "getOrderSummary") return getOrderSummary(order);
+  if (name === "confirmOrder") return confirmOrder(input, order);
+  return { error: `Unknown tool: ${name}` };
+}
+
+// In-memory order state per chat session. Lost on server restart — fine for
+// local development, but must be replaced with real storage before production.
+const orderSessions = new Map();
+
+function createOrderState() {
+  return {
+    items: [], // each: { id, name, quantity, size, options, price }
+    orderType: null, // "pickup" | "delivery"
+    customerDetails: {}, // name, phone, address, pickupTime, etc.
+    discount: null, // { id, name, value } of an applied promotion
+    total: 0,
+    confirmed: false,
+    status: "building", // "building" | "confirmed"
+    suggestedItemIds: [], // ids already recommended this session — never re-suggested
+  };
+}
+
+function getOrCreateSession(requestedId) {
+  if (requestedId && orderSessions.has(requestedId)) {
+    return { sessionId: requestedId, order: orderSessions.get(requestedId) };
   }
+  const sessionId = crypto.randomUUID();
+  const order = createOrderState();
+  orderSessions.set(sessionId, order);
+  return { sessionId, order };
 }
 
-const ADD_ITEM_TOOL = {
-  name: "add_item_to_order",
-  description:
-    "Add one valid menu item to the customer's current order. Only call this once the item " +
-    "(and its size, if the item has sizes) has been confirmed with the customer — do not call " +
-    "it while still asking a clarifying question.",
-  input_schema: {
-    type: "object",
-    properties: {
-      itemId: {
-        type: "string",
-        description: "The 'id' of the menu item from the menu data, exactly as given.",
-      },
-      size: {
-        type: "string",
-        description: "The chosen size, required only if the menu item defines sizes.",
-      },
-      options: {
-        type: "array",
-        items: { type: "string" },
-        description: "Any chosen add-ons from the item's 'options' list in the menu data.",
-      },
-      quantity: {
-        type: "integer",
-        description: "How many of this item to add. Defaults to 1.",
-      },
-    },
-    required: ["itemId"],
-  },
-};
+const app = express();
+app.use(express.json());
+app.use(express.static(path.join(ROOT, "frontend")));
 
-const MODIFY_ITEM_TOOL = {
-  name: "modify_order_item",
-  description:
-    "Change the quantity, size, and/or customizations of an item already in the order. " +
-    "Use the 'id' of the item from the current order data — not the menu item id. Only " +
-    "include the fields that are actually changing.",
-  input_schema: {
-    type: "object",
-    properties: {
-      orderItemId: {
-        type: "string",
-        description: "The 'id' of the item in the current order to change.",
-      },
-      quantity: {
-        type: "integer",
-        description: "New quantity, if changing.",
-      },
-      size: {
-        type: "string",
-        description: "New size, if changing and the item has sizes.",
-      },
-      options: {
-        type: "array",
-        items: { type: "string" },
-        description: "The full replacement list of chosen add-ons, if changing.",
-      },
-    },
-    required: ["orderItemId"],
-  },
-};
-
-const REMOVE_ITEM_TOOL = {
-  name: "remove_order_item",
-  description:
-    "Remove an item from the order entirely. Use the item's 'id' from the current order " +
-    "data — not the menu item id. For reducing quantity but keeping the item, use " +
-    "modify_order_item instead.",
-  input_schema: {
-    type: "object",
-    properties: {
-      orderItemId: {
-        type: "string",
-        description: "The 'id' of the item in the current order to remove.",
-      },
-    },
-    required: ["orderItemId"],
-  },
-};
-
-const APPLY_PROMOTION_TOOL = {
-  name: "apply_promotion",
-  description:
-    "Apply an active promotion to the order, using the promotion's 'id' from the promotions " +
-    "data. Only call this after confirming with the customer that the order meets the " +
-    "promotion's eligibility conditions (e.g. time window, valid student ID, minimum size) — " +
-    "this tool only checks that the promotion exists and is active, not those conditions. " +
-    "Applying a promotion replaces any promotion already on the order.",
-  input_schema: {
-    type: "object",
-    properties: {
-      promotionId: {
-        type: "string",
-        description: "The 'id' of the promotion from the promotions data, exactly as given.",
-      },
-    },
-    required: ["promotionId"],
-  },
-};
-
-const SET_PICKUP_DETAILS_TOOL = {
-  name: "set_pickup_details",
-  description:
-    "Set the order as pickup and record the customer's name and, optionally, a requested pickup " +
-    "time. Call this once the customer has given their name — pickup time is optional, include " +
-    "it only if the customer gave one. Only ask the customer for details not already known from " +
-    "the conversation or the current order data.",
-  input_schema: {
-    type: "object",
-    properties: {
-      customerName: {
-        type: "string",
-        description: "The customer's name for the pickup order.",
-      },
-      pickupTime: {
-        type: "string",
-        description: "Requested pickup time, if the customer gave one. Omit if not specified.",
-      },
-    },
-    required: ["customerName"],
-  },
-};
-
-const SET_DELIVERY_DETAILS_TOOL = {
-  name: "set_delivery_details",
-  description:
-    "Set the order as delivery and record the customer's name, phone number, and full delivery " +
-    "address (all required), plus apartment/unit number and delivery instructions if the " +
-    "customer gives them. Only call this once you actually have each required value from the " +
-    "customer — never guess or fill in a placeholder for anything missing.",
-  input_schema: {
-    type: "object",
-    properties: {
-      customerName: {
-        type: "string",
-        description: "The customer's name for the delivery order.",
-      },
-      phone: {
-        type: "string",
-        description: "The customer's phone number.",
-      },
-      address: {
-        type: "string",
-        description: "The full delivery street address.",
-      },
-      apartmentUnit: {
-        type: "string",
-        description: "Apartment or unit number, if applicable. Omit if not applicable.",
-      },
-      deliveryInstructions: {
-        type: "string",
-        description: "Delivery instructions, if the customer gave any. Omit if none.",
-      },
-    },
-    required: ["customerName", "phone", "address"],
-  },
-};
-
-const CONFIRM_ORDER_TOOL = {
-  name: "confirm_order",
-  description:
-    "Finalize the order. Call this ONLY immediately after the customer gives a clear, " +
-    "unambiguous confirmation of the exact final order summary you just gave them (e.g. \"yes\", " +
-    "\"that's correct\", \"confirmed\", \"place it\"). Never call it on a vague or non-committal " +
-    "reply (e.g. \"ok\", \"sure\", \"I guess\"), silence, a question, or a reply that changes the " +
-    "order — treat all of those as not a confirmation and ask the customer to clearly confirm or " +
-    "say what to change instead.",
-  input_schema: {
-    type: "object",
-    properties: {},
-  },
-};
-
-function isValidHistory(history) {
-  if (!Array.isArray(history)) return false;
-  return history.every(
-    (turn) =>
-      turn &&
-      (turn.role === "user" || turn.role === "assistant") &&
-      typeof turn.content === "string"
-  );
-}
-
-async function callAnthropic(messages, order) {
-  const orderBlock =
-    `Here is a concise summary of the customer's current order. Each line's "id" is only ` +
-    `for use with modify_order_item/remove_order_item — never read an id aloud to the ` +
-    `customer:\n${formatOrderSummary(order)}`;
-
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": LLM_API_KEY,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: LLM_MODEL,
-      max_tokens: 1024,
-      system: `${systemPrompt}\n\n${contextBlock}\n\n${orderBlock}`,
-      messages,
-      tools: [
-        ADD_ITEM_TOOL,
-        MODIFY_ITEM_TOOL,
-        REMOVE_ITEM_TOOL,
-        APPLY_PROMOTION_TOOL,
-        SET_PICKUP_DETAILS_TOOL,
-        SET_DELIVERY_DETAILS_TOOL,
-        CONFIRM_ORDER_TOOL,
-      ],
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`LLM request failed with status ${response.status}`);
-  }
-
-  return response.json();
-}
-
-// Runs the conversation with the LLM, executing add_item_to_order tool calls
-// against `order` as they come up, until the model produces a final text reply.
-async function callLLM(message, history, order) {
-  const messages = [
-    ...history.map((turn) => ({ role: turn.role, content: turn.content })),
-    { role: "user", content: message },
-  ];
-
-  const MAX_TOOL_TURNS = 5;
-  for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
-    const data = await callAnthropic(messages, order);
-
-    if (data.stop_reason !== "tool_use") {
-      const reply = data.content?.find((block) => block.type === "text")?.text;
-      if (typeof reply !== "string") {
-        throw new Error("LLM response did not contain text content");
-      }
-      return reply;
-    }
-
-    messages.push({ role: "assistant", content: data.content });
-
-    const toolResults = data.content
-      .filter((block) => block.type === "tool_use")
-      .map((block) => {
-        const result =
-          block.name === "add_item_to_order"
-            ? addItemToOrder(order, block.input || {})
-            : block.name === "modify_order_item"
-            ? modifyOrderItem(order, block.input || {})
-            : block.name === "remove_order_item"
-            ? removeOrderItem(order, block.input || {})
-            : block.name === "apply_promotion"
-            ? applyPromotion(order, block.input || {})
-            : block.name === "set_pickup_details"
-            ? setPickupDetails(order, block.input || {})
-            : block.name === "set_delivery_details"
-            ? setDeliveryDetails(order, block.input || {})
-            : block.name === "confirm_order"
-            ? confirmOrder(order)
-            : { ok: false, error: `Unknown tool: ${block.name}` };
-        return {
-          type: "tool_result",
-          tool_use_id: block.id,
-          content: JSON.stringify(result),
-        };
-      });
-
-    messages.push({ role: "user", content: toolResults });
-  }
-
-  throw new Error("LLM did not produce a final reply within the tool-use turn limit");
-}
-
-function sendJSON(res, status, body) {
-  res.writeHead(status, { "content-type": "application/json" });
-  res.end(JSON.stringify(body));
-}
-
-function readRequestBody(req) {
-  return new Promise((resolve, reject) => {
-    let raw = "";
-    req.on("data", (chunk) => {
-      raw += chunk;
-    });
-    req.on("end", () => resolve(raw));
-    req.on("error", reject);
-  });
-}
-
-function serveFile(res, filePath, contentType) {
-  fs.readFile(filePath, (err, data) => {
-    if (err) {
-      sendJSON(res, 404, { error: "Not found" });
-      return;
-    }
-    res.writeHead(200, { "content-type": contentType });
-    res.end(data);
-  });
-}
-
-async function handleChat(req, res) {
-  let body;
-  try {
-    body = JSON.parse(await readRequestBody(req));
-  } catch {
-    sendJSON(res, 400, { error: "Invalid JSON body" });
-    return;
-  }
-
-  const { message, history = [], sessionId: requestedSessionId } = body;
+app.post("/api/chat", async (req, res) => {
+  const { message, history, sessionId: requestedSessionId } = req.body || {};
 
   if (typeof message !== "string" || message.trim() === "") {
-    sendJSON(res, 400, { error: "'message' must be a non-empty string" });
-    return;
+    return res.status(400).json({ error: "'message' is required" });
   }
-  if (!isValidHistory(history)) {
-    sendJSON(res, 400, {
-      error: "'history' must be an array of { role: 'user'|'assistant', content: string }",
+
+  const { sessionId, order } = getOrCreateSession(requestedSessionId);
+  const messages = [...(Array.isArray(history) ? history : []), { role: "user", content: message }];
+
+  try {
+    let response = await anthropic.messages.create({
+      model: CHAT_MODEL,
+      max_tokens: 1024,
+      system: SYSTEM_PROMPT,
+      tools: TOOLS,
+      messages,
     });
-    return;
+
+    while (response.stop_reason === "tool_use") {
+      const toolUseBlocks = response.content.filter((block) => block.type === "tool_use");
+      messages.push({ role: "assistant", content: response.content });
+      messages.push({
+        role: "user",
+        content: toolUseBlocks.map((block) => ({
+          type: "tool_result",
+          tool_use_id: block.id,
+          content: JSON.stringify(runTool(block.name, block.input, order)),
+        })),
+      });
+
+      response = await anthropic.messages.create({
+        model: CHAT_MODEL,
+        max_tokens: 1024,
+        system: SYSTEM_PROMPT,
+        tools: TOOLS,
+        messages,
+      });
+    }
+
+    const reply = response.content.find((block) => block.type === "text")?.text || FALLBACK_REPLY;
+    res.json({ reply, sessionId });
+  } catch (err) {
+    console.error("Claude API request failed:", err.message);
+    res.json({ reply: FALLBACK_REPLY, sessionId });
   }
-  if (!LLM_API_KEY || !LLM_MODEL) {
-    sendJSON(res, 500, { error: "Server is missing LLM configuration" });
-    return;
-  }
-
-  const { sessionId, order } = getSession(requestedSessionId);
-
-  try {
-    const reply = await callLLM(message.trim(), history, order);
-    sendJSON(res, 200, { reply, sessionId, order });
-  } catch {
-    sendJSON(res, 502, { error: "Failed to get a response from the LLM" });
-  }
-}
-
-async function handleUpdateOrderStatus(req, res, orderId) {
-  let body;
-  try {
-    body = JSON.parse(await readRequestBody(req));
-  } catch {
-    sendJSON(res, 400, { error: "Invalid JSON body" });
-    return;
-  }
-
-  const result = updateOrderStatus(orderId, body.status);
-  sendJSON(res, result.ok ? 200 : 400, result);
-}
-
-const DASHBOARD_HTML_PATH = path.join(ROOT, "frontend", "dashboard.html");
-const DASHBOARD_JS_PATH = path.join(ROOT, "frontend", "dashboard.js");
-const INDEX_HTML_PATH = path.join(ROOT, "frontend", "index.html");
-const STYLE_CSS_PATH = path.join(ROOT, "frontend", "style.css");
-const SCRIPT_JS_PATH = path.join(ROOT, "frontend", "script.js");
-
-const server = http.createServer((req, res) => {
-  const pathname = req.url.split("?")[0];
-  const statusMatch = pathname.match(/^\/api\/orders\/([^/]+)\/status$/);
-
-  if (req.method === "POST" && pathname === "/api/chat") {
-    handleChat(req, res);
-    return;
-  }
-
-  if (req.method === "GET" && pathname === "/api/orders") {
-    sendJSON(res, 200, { orders: readSavedOrders() });
-    return;
-  }
-
-  if (req.method === "POST" && statusMatch) {
-    handleUpdateOrderStatus(req, res, decodeURIComponent(statusMatch[1]));
-    return;
-  }
-
-  if (req.method === "GET" && pathname === "/dashboard.html") {
-    serveFile(res, DASHBOARD_HTML_PATH, "text/html");
-    return;
-  }
-
-  if (req.method === "GET" && pathname === "/dashboard.js") {
-    serveFile(res, DASHBOARD_JS_PATH, "application/javascript");
-    return;
-  }
-
-  if (req.method === "GET" && (pathname === "/" || pathname === "/index.html")) {
-    serveFile(res, INDEX_HTML_PATH, "text/html");
-    return;
-  }
-
-  if (req.method === "GET" && pathname === "/style.css") {
-    serveFile(res, STYLE_CSS_PATH, "text/css");
-    return;
-  }
-
-  if (req.method === "GET" && pathname === "/script.js") {
-    serveFile(res, SCRIPT_JS_PATH, "application/javascript");
-    return;
-  }
-
-  sendJSON(res, 404, { error: "Not found" });
 });
 
-server.listen(PORT, () => {
+app.get("/api/orders", (req, res) => {
+  const orders = JSON.parse(fs.readFileSync(ORDERS_PATH, "utf8"));
+  res.json({ orders });
+});
+
+app.post("/api/orders/:orderId/status", (req, res) => {
+  const { status } = req.body || {};
+
+  if (!ORDER_STATUSES.includes(status)) {
+    return res.status(400).json({ error: `status must be one of: ${ORDER_STATUSES.join(", ")}` });
+  }
+
+  const orders = JSON.parse(fs.readFileSync(ORDERS_PATH, "utf8"));
+  const order = orders.find((o) => o.orderId === req.params.orderId);
+  if (!order) {
+    return res.status(404).json({ error: `No order with id "${req.params.orderId}".` });
+  }
+
+  order.status = status;
+  fs.writeFileSync(ORDERS_PATH, JSON.stringify(orders, null, 2) + "\n");
+  res.json({ order });
+});
+
+app.listen(PORT, () => {
   console.log(`Tea Time Cafe backend listening on port ${PORT}`);
 });

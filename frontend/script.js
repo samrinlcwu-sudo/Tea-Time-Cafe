@@ -1,5 +1,6 @@
 const CHAT_API_URL = "/api/chat";
 const ERROR_REPLY = "Sorry, I'm having trouble connecting right now. Please try again in a moment.";
+const HISTORY_LIMIT = 10; // keep only recent turns, per token-saving rule
 
 const toggleEl = document.getElementById("chat-toggle");
 const widgetEl = document.getElementById("chat-widget");
@@ -43,10 +44,20 @@ toggleEl.addEventListener("click", () => {
 
 closeEl.addEventListener("click", closeWidget);
 
+function startTyping() {
+  const bubble = addBubble("bot", ".");
+  let dots = 1;
+  const timer = setInterval(() => {
+    dots = (dots % 3) + 1;
+    bubble.textContent = ".".repeat(dots);
+  }, 400);
+  return { bubble, stop: () => clearInterval(timer) };
+}
+
 async function sendMessage(text) {
   inputEl.disabled = true;
   sendButtonEl.disabled = true;
-  const replyBubble = addBubble("bot", "…");
+  const typing = startTyping();
 
   try {
     const res = await fetch(CHAT_API_URL, {
@@ -60,12 +71,17 @@ async function sendMessage(text) {
       throw new Error(data.error || "Request failed");
     }
 
-    replyBubble.textContent = data.reply;
+    typing.stop();
+    typing.bubble.textContent = data.reply;
     sessionId = data.sessionId;
     history.push({ role: "user", content: text });
     history.push({ role: "assistant", content: data.reply });
+    if (history.length > HISTORY_LIMIT) {
+      history = history.slice(-HISTORY_LIMIT);
+    }
   } catch {
-    replyBubble.textContent = ERROR_REPLY;
+    typing.stop();
+    typing.bubble.textContent = ERROR_REPLY;
   } finally {
     inputEl.disabled = false;
     sendButtonEl.disabled = false;
