@@ -10,9 +10,9 @@ just a plain Node.js backend, static JSON data, and a small staff dashboard.
 - **`prompts/`** — System prompt defining Tea Time Cafe's role, tone, and rules.
 - **`data/`** — Static JSON data: `menu.json`, `promotions.json`, and a
   generated `orders.json` (created on first confirmed order; not committed).
-- **`frontend/`** — `index.html`/`script.js` is a placeholder chat UI with
-  mock messages — it is **not yet wired to the backend**. `dashboard.html`/
-  `dashboard.js` is a working staff dashboard served directly by the backend.
+- **`frontend/`** — `index.html`/`script.js` is the customer-facing chat UI,
+  wired to `POST /api/chat`. `dashboard.html`/`dashboard.js` is a working
+  staff dashboard served directly by the backend.
 - **`backend/server.js`** — The API server. Loads the system prompt + data,
   calls the LLM, manages order state, and serves the dashboard.
 - **`.env.example`** / **`.env`** — API key and config. `.env` is never
@@ -20,8 +20,9 @@ just a plain Node.js backend, static JSON data, and a small staff dashboard.
 
 ## Requirements
 
-- Node.js 20.12 or later (uses `process.loadEnvFile`, no other dependencies).
+- Node.js 20.12 or later.
 - An Anthropic API key.
+- Run `npm install` to install dependencies (Express, dotenv, the Anthropic SDK).
 
 ## Setup
 
@@ -31,11 +32,10 @@ just a plain Node.js backend, static JSON data, and a small staff dashboard.
    cp .env.example .env
    ```
 
-   | Variable       | Required | Description                                   |
-   | -------------- | -------- | ---------------------------------------------- |
-   | `LLM_API_KEY`  | Yes      | Anthropic API key. Chat requests fail without it. |
-   | `LLM_MODEL`    | Yes      | Model name, e.g. `claude-sonnet-5`.             |
-   | `PORT`         | No       | Defaults to `3000`.                             |
+   | Variable            | Required | Description                                   |
+   | ------------------- | -------- | ---------------------------------------------- |
+   | `ANTHROPIC_API_KEY` | Yes      | Anthropic API key. Chat requests fail without it. |
+   | `PORT`              | No       | Defaults to `3000`.                             |
 
    `.env` is gitignored — never commit it. On a hosting platform, set these
    as environment variables/secrets in the platform's dashboard rather than
@@ -47,21 +47,19 @@ just a plain Node.js backend, static JSON data, and a small staff dashboard.
    npm start
    ```
 
-   (equivalent to `node backend/server.js`). If `LLM_API_KEY` or `LLM_MODEL`
-   is missing, the server still starts (the dashboard and order endpoints
-   don't need them) but logs a warning and `/api/chat` will return a 500
-   until both are set.
+   (equivalent to `node backend/server.js`). If `ANTHROPIC_API_KEY` is
+   missing, the server still starts (the dashboard and order endpoints
+   don't need it) but `/api/chat` will fail to reach the LLM until it's set.
 
 ## What's running
 
-- `POST /api/chat` — chat endpoint used by the frontend (requires the LLM
-  env vars above).
+- `POST /api/chat` — chat endpoint used by the frontend (requires
+  `ANTHROPIC_API_KEY`).
 - `GET /api/orders` / `POST /api/orders/:orderId/status` — used by the
   dashboard; don't touch the LLM.
 - `GET /dashboard.html` — staff dashboard (order list + status controls).
-- `frontend/index.html` — customer-facing chat UI. Currently a static mock
-  (hardcoded sample messages, no real fetch call) — open it directly as a
-  file or serve it separately; it does not yet call `/api/chat`.
+- `frontend/index.html` — customer-facing chat UI, served by the backend
+  and wired to `POST /api/chat`.
 
 ## Known limitations to consider before deploying publicly
 
@@ -72,10 +70,8 @@ just a plain Node.js backend, static JSON data, and a small staff dashboard.
   beyond local development.
 - Orders are stored in a flat `data/orders.json` file, not a database —
   fine for low traffic, but there's no concurrent-write protection.
-- `frontend/index.html`/`script.js` doesn't call the backend yet (see above).
 
 ## Status
 
-Backend, ordering flow, promotions, and staff dashboard are implemented.
-Customer-facing frontend is a placeholder pending real integration with
-`/api/chat`.
+Backend, ordering flow, promotions, customer-facing chat UI, and staff
+dashboard are all implemented and working end-to-end.

@@ -15,6 +15,12 @@ const FALLBACK_REPLY = "Sorry, I'm having trouble reaching the kitchen right now
 const TAX_RATE = 0.08;
 const DELIVERY_FEE = 3.0;
 
+// Orders are persisted by reading/writing this JSON file directly. This is
+// fine for local development and demos, but not for production: on
+// serverless platforms like Vercel, functions run in ephemeral instances
+// with a read-only (or non-shared) filesystem, so writes here are not
+// guaranteed to persist or to be visible across requests. Replace with a
+// real database before deploying anywhere serverless.
 const ORDERS_PATH = path.join(ROOT, "data", "orders.json");
 const ORDER_STATUSES = ["NEW", "PREPARING", "READY", "COMPLETED"];
 
