@@ -8,6 +8,7 @@ require("dotenv").config();
 
 const ROOT = path.join(__dirname, "..");
 const PORT = process.env.PORT || 3000;
+const STAFF_PASSWORD = process.env.STAFF_PASSWORD;
 const CHAT_MODEL = "claude-haiku-4-5-20251001";
 const FALLBACK_REPLY = "Sorry, I'm having trouble reaching the kitchen right now — please try again in a moment.";
 
@@ -693,8 +694,38 @@ function getOrCreateSession(requestedId) {
   return { sessionId, order };
 }
 
+// Gates the staff dashboard and orders API behind a single shared password
+// (HTTP Basic Auth). Fails closed if STAFF_PASSWORD isn't configured, rather
+// than silently letting everyone in.
+function requireStaffAuth(req, res, next) {
+  if (!STAFF_PASSWORD) {
+    return res.status(500).send("Dashboard is not configured: set STAFF_PASSWORD in .env.");
+  }
+
+  const header = req.headers.authorization || "";
+  const [scheme, encoded] = header.split(" ");
+
+  if (scheme === "Basic" && encoded) {
+    const decoded = Buffer.from(encoded, "base64").toString("utf8");
+    const password = decoded.slice(decoded.indexOf(":") + 1);
+    const expected = Buffer.from(STAFF_PASSWORD);
+    const actual = Buffer.from(password);
+    if (expected.length === actual.length && crypto.timingSafeEqual(expected, actual)) {
+      return next();
+    }
+  }
+
+  res.set("WWW-Authenticate", 'Basic realm="Tea Time Cafe Staff Dashboard"');
+  return res.status(401).send("Authentication required.");
+}
+
 const app = express();
 app.use(express.json());
+
+app.get("/dashboard.html", requireStaffAuth, (req, res) => {
+  res.sendFile(path.join(ROOT, "frontend", "dashboard.html"));
+});
+
 app.use(express.static(path.join(ROOT, "frontend")));
 
 app.post("/api/chat", async (req, res) => {
@@ -745,12 +776,12 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
-app.get("/api/orders", (req, res) => {
+app.get("/api/orders", requireStaffAuth, (req, res) => {
   const orders = JSON.parse(fs.readFileSync(ORDERS_PATH, "utf8"));
   res.json({ orders });
 });
 
-app.post("/api/orders/:orderId/status", (req, res) => {
+app.post("/api/orders/:orderId/status", requireStaffAuth, (req, res) => {
   const { status } = req.body || {};
 
   if (!ORDER_STATUSES.includes(status)) {

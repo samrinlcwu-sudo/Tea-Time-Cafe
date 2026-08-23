@@ -36,6 +36,7 @@ just a plain Node.js backend, static JSON data, and a small staff dashboard.
    | ------------------- | -------- | ---------------------------------------------- |
    | `ANTHROPIC_API_KEY` | Yes      | Anthropic API key. Chat requests fail without it. |
    | `PORT`              | No       | Defaults to `3000`.                             |
+   | `STAFF_PASSWORD`    | Yes      | Shared password for the staff dashboard and `/api/orders*` (HTTP Basic Auth). |
 
    `.env` is gitignored — never commit it. On a hosting platform, set these
    as environment variables/secrets in the platform's dashboard rather than
@@ -56,18 +57,17 @@ just a plain Node.js backend, static JSON data, and a small staff dashboard.
 - `POST /api/chat` — chat endpoint used by the frontend (requires
   `ANTHROPIC_API_KEY`).
 - `GET /api/orders` / `POST /api/orders/:orderId/status` — used by the
-  dashboard; don't touch the LLM.
+  dashboard; don't touch the LLM. Requires `STAFF_PASSWORD` (HTTP Basic Auth).
 - `GET /dashboard.html` — staff dashboard (order list + status controls).
+  Requires `STAFF_PASSWORD` (HTTP Basic Auth).
 - `frontend/index.html` — customer-facing chat UI, served by the backend
   and wired to `POST /api/chat`.
 
 ## Known limitations to consider before deploying publicly
 
-- No authentication on the dashboard or `/api/orders*` endpoints — anyone
-  who can reach the server can view customer PII (name, phone, delivery
-  address) and change order statuses. Restrict network access (e.g. put it
-  behind a VPN, IP allowlist, or reverse-proxy auth) before exposing it
-  beyond local development.
+- The dashboard and `/api/orders*` endpoints are protected by a single
+  shared password (`STAFF_PASSWORD`, HTTP Basic Auth) — fine for one small
+  team, but there's no per-user accounts, roles, or audit trail.
 - Orders are stored in a flat `data/orders.json` file, not a database —
   fine for low traffic, but there's no concurrent-write protection.
 

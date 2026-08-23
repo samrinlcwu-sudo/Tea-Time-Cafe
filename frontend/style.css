@@ -3,7 +3,7 @@
   --color-primary-dark: #7559ad;
   --color-primary-darker: #5a4189;
   --color-text: #453a6b;
-  --color-text-muted: #7a6ea0;
+  --color-text-muted: #6c5f93;
   --color-bg: #fffaf5;
   --color-bg-alt: #f2ece4;
   --color-card-bg: #f9f4ee;
@@ -114,7 +114,7 @@ a {
   position: sticky;
   top: 0;
   z-index: 10;
-  background: var(--color-primary);
+  background: var(--color-primary-dark);
   color: #fff;
   box-shadow: var(--shadow-md);
 }
@@ -209,7 +209,7 @@ a {
 
 .cta-button {
   display: inline-block;
-  background: var(--color-primary);
+  background: var(--color-primary-dark);
   color: #fff;
   text-decoration: none;
   font-weight: 700;
@@ -222,7 +222,7 @@ a {
 
 .cta-button:hover,
 .cta-button:focus-visible {
-  background: var(--color-primary-dark);
+  background: var(--color-primary-darker);
   transform: translateY(-2px);
   box-shadow: 0 10px 24px rgba(90, 65, 137, 0.2);
 }
@@ -455,7 +455,7 @@ a {
   height: 3.5rem;
   border-radius: 50%;
   border: none;
-  background: var(--color-primary);
+  background: var(--color-primary-dark);
   color: #fff;
   font-size: 1.5rem;
   display: flex;
@@ -469,7 +469,7 @@ a {
 
 .chat-toggle:hover,
 .chat-toggle:focus-visible {
-  background: var(--color-primary-dark);
+  background: var(--color-primary-darker);
   transform: translateY(-2px) scale(1.04);
 }
 
@@ -516,7 +516,7 @@ a {
   align-items: center;
   gap: 0.5rem;
   padding: 0.95rem 1rem;
-  background: var(--color-primary);
+  background: var(--color-primary-dark);
   color: #fff;
   flex-shrink: 0;
 }
@@ -578,7 +578,7 @@ a {
 
 .chat-bubble-customer {
   align-self: flex-end;
-  background: var(--color-primary);
+  background: var(--color-primary-dark);
   color: #fff;
   border-bottom-right-radius: 0.25rem;
 }
@@ -609,7 +609,7 @@ a {
 
 .chat-widget-form button {
   padding: 0.65rem 1.15rem;
-  background: var(--color-primary);
+  background: var(--color-primary-dark);
   color: #fff;
   border: none;
   border-radius: var(--radius-pill);
@@ -621,7 +621,7 @@ a {
 
 .chat-widget-form button:hover,
 .chat-widget-form button:focus-visible {
-  background: var(--color-primary-dark);
+  background: var(--color-primary-darker);
 }
 
 .chat-widget-form button:active {
