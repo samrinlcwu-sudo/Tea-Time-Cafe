@@ -1,9 +1,9 @@
 :root {
-  --color-primary: #689f38;
-  --color-primary-dark: #558b2f;
-  --color-primary-darker: #33691e;
-  --color-text: #33691e;
-  --color-text-muted: #4f7942;
+  --color-primary: #8a6fc4;
+  --color-primary-dark: #7559ad;
+  --color-primary-darker: #5a4189;
+  --color-text: #453a6b;
+  --color-text-muted: #7a6ea0;
   --color-bg: #fffaf5;
   --color-bg-alt: #f2ece4;
   --color-card-bg: #f9f4ee;
@@ -11,9 +11,9 @@
   --color-border-strong: #d9cdbe;
   --color-danger: #a13a3a;
 
-  --shadow-sm: 0 1px 3px rgba(51, 105, 30, 0.08);
-  --shadow-md: 0 6px 20px rgba(51, 105, 30, 0.12);
-  --shadow-lg: 0 12px 32px rgba(20, 40, 10, 0.22);
+  --shadow-sm: 0 1px 3px rgba(90, 65, 137, 0.08);
+  --shadow-md: 0 6px 20px rgba(90, 65, 137, 0.12);
+  --shadow-lg: 0 12px 32px rgba(45, 30, 74, 0.22);
 
   --radius-sm: 0.5rem;
   --radius-md: 0.75rem;
@@ -224,7 +224,7 @@ a {
 .cta-button:focus-visible {
   background: var(--color-primary-dark);
   transform: translateY(-2px);
-  box-shadow: 0 10px 24px rgba(51, 105, 30, 0.2);
+  box-shadow: 0 10px 24px rgba(90, 65, 137, 0.2);
 }
 
 /* About */
