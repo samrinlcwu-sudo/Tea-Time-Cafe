@@ -69,7 +69,10 @@ just a plain Node.js backend, static JSON data, and a small staff dashboard.
   shared password (`STAFF_PASSWORD`, HTTP Basic Auth) — fine for one small
   team, but there's no per-user accounts, roles, or audit trail.
 - Orders are stored in a flat `data/orders.json` file, not a database —
-  fine for low traffic, but there's no concurrent-write protection.
+  fine for low traffic. Reads/writes go through shared helpers using
+  synchronous `fs` calls, so a read-modify-write always completes before the
+  next request can start (no lost updates within a single process) — this
+  does not extend to running multiple server instances/processes.
 
 ## Status
 

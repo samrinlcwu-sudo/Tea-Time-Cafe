@@ -25,6 +25,25 @@ const DELIVERY_FEE = 3.0;
 const ORDERS_PATH = path.join(ROOT, "data", "orders.json");
 const ORDER_STATUSES = ["NEW", "PREPARING", "READY", "COMPLETED"];
 
+// Always go through these two helpers to read/write orders.json, never
+// fs.*Sync directly. Both use the *Sync fs calls, which block the event
+// loop, so a read-modify-write (load, mutate, save) always completes before
+// the next request's handler can run — two requests can't interleave and
+// silently drop each other's changes. That guarantee only holds within a
+// single Node process; it would not hold if this were ever run as multiple
+// processes/instances sharing the file.
+function loadOrders() {
+  // orders.json is gitignored (it holds customer PII), so a fresh clone or
+  // deploy won't have it yet — treat "missing" as "no orders" instead of
+  // crashing on the first request.
+  if (!fs.existsSync(ORDERS_PATH)) return [];
+  return JSON.parse(fs.readFileSync(ORDERS_PATH, "utf8"));
+}
+
+function saveOrders(orders) {
+  fs.writeFileSync(ORDERS_PATH, JSON.stringify(orders, null, 2) + "\n");
+}
+
 const BASE_SYSTEM_PROMPT = fs.readFileSync(path.join(ROOT, "prompts", "system-prompt.md"), "utf8");
 const SYSTEM_PROMPT = `${BASE_SYSTEM_PROMPT}\n\n## Menu Lookups\n\nUse the \`getMenu\` tool to look up current, active menu items whenever the customer asks about the menu — never answer from memory or invent items, prices, sizes, or allergens.\n\n## Adding Items\n\nUse the \`addItemToCart\` tool to add an item once you know its id (from getMenu), quantity, and size (if the item has sizes). If a required size is missing, the tool will refuse and tell you what's needed — ask the customer for it instead of guessing. Only call the tool once you have everything it needs.\n\n## Modifying Items\n\nUse the \`modifyItem\` tool to change the quantity, size, or options of an item already in the order — identify it by its position (itemIndex) in the order's items array, as most recently shown to you. If the change is invalid (bad size/option, or quantity below 1), the tool will refuse and explain why — ask the customer rather than retrying with a guess. This tool cannot remove items or take them to zero.\n\n## Removing Items\n\nUse the \`removeItem\` tool to remove an item entirely, or reduce its quantity, from the order — identify it by its position (itemIndex) in the order's items array, as most recently shown to you. Omit \`quantity\` to remove the item entirely; pass a \`quantity\` to remove just that many (the item is removed entirely if that meets or exceeds what's there). If the index doesn't exist, the tool will refuse and explain why — ask the customer rather than retrying with a guess.\n\n## Viewing the Cart\n\nUse the \`viewCart\` tool to see the current order's items, quantities, and customizations — e.g. before confirming, before modifying/removing by index, or whenever the customer asks what's in their order. It does not include a total yet.\n\n## Recommendations\n\nAfter adding an item to the order, you may call \`getRecommendations\` to see 1-2 real, currently-available menu items that pair well with the order. Only mention items the tool actually returns — never invent a suggestion. If the tool returns an empty list, don't offer anything. Offer a suggestion at most once per item — the tool already tracks what's been suggested and won't return the same item twice, so if the customer declines or ignores a suggestion, don't bring it up again.\n\n## Promotions\n\nUse \`applyPromotion\` with no \`promotionId\` to check which active promotions (from data/promotions.json) the current order currently qualifies for, and only mention promotions it actually returns — never invent a discount, percentage, or code. To apply one, call it again with that exact \`promotionId\`. If it applies the Student Discount, tell the customer they'll need to show a valid student ID at pickup/register. Never accept or apply a discount code the customer types in themselves unless it matches a promotion the tool confirms is real, active, and eligible — if it doesn't, tell them it's not valid rather than guessing what they meant.\n\n## Pickup Details\n\nBefore finalizing an order, call \`setPickupDetails\` with no arguments to see what's already been collected. It returns the current name, pickup time, and a \`missing\` list — only ask the customer for what's actually listed as missing. Name is required; pickup time is optional, so if the customer doesn't give one, proceed without it. Once you have new information to record, call the tool again passing just the field(s) you're setting.\n\n## Delivery Details\n\nIf the customer wants delivery instead of pickup, call \`setDeliveryDetails\` with no arguments to see what's already been collected. It returns the current name, phone, address, apartment/unit, delivery instructions, and a \`missing\` list — only ask for what's actually listed as missing. Name, phone, and address are required; apartment/unit and delivery instructions are optional, so don't ask for them unless it's natural to (e.g. after getting the address). Never guess or fill in any of these fields yourself — only record what the customer actually told you. Once you have new information, call the tool again passing just the field(s) you're setting.\n\nBefore checkout on a delivery order, once \`missing\` is empty, read the full captured address back to the customer (street address, apartment/unit if any, and delivery instructions if any) and explicitly ask them to confirm it's correct — do not proceed to checkout without this. If they confirm, call \`setDeliveryDetails\` again with only \`confirmed: true\`. If they correct anything, set the corrected field(s) instead (this automatically clears the prior confirmation), then read the updated address back and ask again.\n\n## Order Total\n\nNever calculate, estimate, or state a subtotal, tax, delivery fee, or total yourself — always call \`getOrderTotal\` and report exactly the numbers it returns. Call it whenever the customer asks what they owe, and always right before final checkout confirmation. Delivery fee only applies to delivery orders; it will be 0 for pickup. If a promotion is applied, its discount amount is already reflected in the numbers returned.\n\n## Order Summary\n\nBefore asking the customer for final checkout confirmation, call \`getOrderSummary\` and present exactly what it returns: the items with quantities/customizations, the fulfillment details (pickup or delivery), the applied promotion (if any), and the full price breakdown. Don't reconstruct this from memory or earlier tool calls — always pull the current state fresh from this tool right before checkout, since anything could have changed since you last checked.\n\n## Confirming and Saving the Order\n\nOnly call \`confirmOrder\` (with confirmed: true) after the customer has explicitly confirmed the summary you presented — a clear \"yes\", \"confirm\", \"place the order\", or equivalent. Never call it proactively, right after showing the summary without a reply, or on an assumption that they're done. Never save a draft, incomplete, or unconfirmed order this way. If it returns an error, tell the customer what's missing or wrong rather than retrying blindly. Never tell the customer their order is placed, and never state an order ID, unless \`confirmOrder\` just returned \`saved: true\` in this same turn — quote the \`orderId\` field exactly as returned, character for character; never invent, guess, shorten, or reformat it.`;
 
@@ -640,9 +659,9 @@ function confirmOrder(input, order) {
     pricing: summary.pricing,
   };
 
-  const orders = JSON.parse(fs.readFileSync(ORDERS_PATH, "utf8"));
+  const orders = loadOrders();
   orders.push(record);
-  fs.writeFileSync(ORDERS_PATH, JSON.stringify(orders, null, 2) + "\n");
+  saveOrders(orders);
 
   order.confirmed = true;
   order.status = "confirmed";
@@ -777,7 +796,7 @@ app.post("/api/chat", async (req, res) => {
 });
 
 app.get("/api/orders", requireStaffAuth, (req, res) => {
-  const orders = JSON.parse(fs.readFileSync(ORDERS_PATH, "utf8"));
+  const orders = loadOrders();
   res.json({ orders });
 });
 
@@ -788,14 +807,14 @@ app.post("/api/orders/:orderId/status", requireStaffAuth, (req, res) => {
     return res.status(400).json({ error: `status must be one of: ${ORDER_STATUSES.join(", ")}` });
   }
 
-  const orders = JSON.parse(fs.readFileSync(ORDERS_PATH, "utf8"));
+  const orders = loadOrders();
   const order = orders.find((o) => o.orderId === req.params.orderId);
   if (!order) {
     return res.status(404).json({ error: `No order with id "${req.params.orderId}".` });
   }
 
   order.status = status;
-  fs.writeFileSync(ORDERS_PATH, JSON.stringify(orders, null, 2) + "\n");
+  saveOrders(orders);
   res.json({ order });
 });
 
