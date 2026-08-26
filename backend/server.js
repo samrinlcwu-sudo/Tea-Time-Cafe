@@ -4,6 +4,7 @@ const fs = require("fs");
 const crypto = require("crypto");
 const express = require("express");
 const Anthropic = require("@anthropic-ai/sdk");
+const { put, list, get } = require("@vercel/blob");
 require("dotenv").config();
 
 const ROOT = path.join(__dirname, "..");
@@ -16,32 +17,37 @@ const FALLBACK_REPLY = "Sorry, I'm having trouble reaching the kitchen right now
 const TAX_RATE = 0.08;
 const DELIVERY_FEE = 3.0;
 
-// Orders are persisted by reading/writing this JSON file directly. This is
-// fine for local development and demos, but not for production: on
-// serverless platforms like Vercel, functions run in ephemeral instances
-// with a read-only (or non-shared) filesystem, so writes here are not
-// guaranteed to persist or to be visible across requests. Replace with a
-// real database before deploying anywhere serverless.
-const ORDERS_PATH = path.join(ROOT, "data", "orders.json");
+// Orders are persisted to a private Vercel Blob (pathname "orders.json"),
+// not a local file. On serverless platforms like Vercel, each request can
+// land on a different, disposable instance with its own throwaway
+// filesystem, so a local file write is invisible to the next request —
+// Blob storage is shared across every instance instead. Reads/writes here
+// aren't atomic across concurrent requests (no compare-and-swap), same
+// single-writer assumption as before, just scoped to the whole app instead
+// of one process — fine for this app's order volume.
+const ORDERS_BLOB_PATH = "orders.json";
 const ORDER_STATUSES = ["NEW", "PREPARING", "READY", "COMPLETED"];
 
-// Always go through these two helpers to read/write orders.json, never
-// fs.*Sync directly. Both use the *Sync fs calls, which block the event
-// loop, so a read-modify-write (load, mutate, save) always completes before
-// the next request's handler can run — two requests can't interleave and
-// silently drop each other's changes. That guarantee only holds within a
-// single Node process; it would not hold if this were ever run as multiple
-// processes/instances sharing the file.
-function loadOrders() {
-  // orders.json is gitignored (it holds customer PII), so a fresh clone or
-  // deploy won't have it yet — treat "missing" as "no orders" instead of
-  // crashing on the first request.
-  if (!fs.existsSync(ORDERS_PATH)) return [];
-  return JSON.parse(fs.readFileSync(ORDERS_PATH, "utf8"));
+// Always go through these two helpers to read/write orders, never call the
+// Blob SDK directly elsewhere.
+async function loadOrders() {
+  // No blob yet on a fresh store (before the first confirmed order) — treat
+  // "missing" as "no orders" instead of crashing on the first request.
+  const { blobs } = await list({ prefix: ORDERS_BLOB_PATH, limit: 1 });
+  if (blobs.length === 0) return [];
+  const result = await get(blobs[0].url, { access: "private" });
+  if (!result) return [];
+  const text = await new Response(result.stream).text();
+  return JSON.parse(text);
 }
 
-function saveOrders(orders) {
-  fs.writeFileSync(ORDERS_PATH, JSON.stringify(orders, null, 2) + "\n");
+async function saveOrders(orders) {
+  await put(ORDERS_BLOB_PATH, JSON.stringify(orders, null, 2) + "\n", {
+    access: "private",
+    addRandomSuffix: false,
+    allowOverwrite: true,
+    contentType: "application/json",
+  });
 }
 
 const BASE_SYSTEM_PROMPT = fs.readFileSync(path.join(ROOT, "prompts", "system-prompt.md"), "utf8");
@@ -615,7 +621,7 @@ function getOrderSummary(order) {
   };
 }
 
-function confirmOrder(input, order) {
+async function confirmOrder(input, order) {
   const { confirmed } = input || {};
 
   if (confirmed !== true) {
@@ -659,9 +665,9 @@ function confirmOrder(input, order) {
     pricing: summary.pricing,
   };
 
-  const orders = loadOrders();
+  const orders = await loadOrders();
   orders.push(record);
-  saveOrders(orders);
+  await saveOrders(orders);
 
   order.confirmed = true;
   order.status = "confirmed";
@@ -670,7 +676,7 @@ function confirmOrder(input, order) {
   return { saved: true, orderId: record.orderId, timestamp: record.timestamp, status: record.status };
 }
 
-function runTool(name, input, order) {
+async function runTool(name, input, order) {
   if (name === "getMenu") return getMenu();
   if (name === "addItemToCart") return addItemToCart(input, order);
   if (name === "modifyItem") return modifyItem(input, order);
@@ -769,14 +775,14 @@ app.post("/api/chat", async (req, res) => {
     while (response.stop_reason === "tool_use") {
       const toolUseBlocks = response.content.filter((block) => block.type === "tool_use");
       messages.push({ role: "assistant", content: response.content });
-      messages.push({
-        role: "user",
-        content: toolUseBlocks.map((block) => ({
+      const toolResults = await Promise.all(
+        toolUseBlocks.map(async (block) => ({
           type: "tool_result",
           tool_use_id: block.id,
-          content: JSON.stringify(runTool(block.name, block.input, order)),
-        })),
-      });
+          content: JSON.stringify(await runTool(block.name, block.input, order)),
+        }))
+      );
+      messages.push({ role: "user", content: toolResults });
 
       response = await anthropic.messages.create({
         model: CHAT_MODEL,
@@ -795,29 +801,35 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
-app.get("/api/orders", requireStaffAuth, (req, res) => {
-  const orders = loadOrders();
+app.get("/api/orders", requireStaffAuth, async (req, res) => {
+  const orders = await loadOrders();
   res.json({ orders });
 });
 
-app.post("/api/orders/:orderId/status", requireStaffAuth, (req, res) => {
+app.post("/api/orders/:orderId/status", requireStaffAuth, async (req, res) => {
   const { status } = req.body || {};
 
   if (!ORDER_STATUSES.includes(status)) {
     return res.status(400).json({ error: `status must be one of: ${ORDER_STATUSES.join(", ")}` });
   }
 
-  const orders = loadOrders();
+  const orders = await loadOrders();
   const order = orders.find((o) => o.orderId === req.params.orderId);
   if (!order) {
     return res.status(404).json({ error: `No order with id "${req.params.orderId}".` });
   }
 
   order.status = status;
-  saveOrders(orders);
+  await saveOrders(orders);
   res.json({ order });
 });
 
-app.listen(PORT, () => {
-  console.log(`Tea Time Cafe backend listening on port ${PORT}`);
-});
+// Only bind a port for local/`npm start` use. On Vercel, @vercel/node imports
+// this file's export and calls it per-request instead of running app.listen.
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Tea Time Cafe backend listening on port ${PORT}`);
+  });
+}
+
+module.exports = app;
